@@ -1,9 +1,28 @@
+
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from ultralytics import YOLO
 from PIL import Image
 import io
 import uvicorn
+import traceback
+from pydantic import BaseModel
+from typing import Optional
+
+class BoundingBox(BaseModel):
+    x: int
+    y: int
+    width: int
+    height: int
+
+class PredictResponse(BaseModel):
+    status: str
+    confidence: Optional[float] = None
+    kualitas: Optional[str] = None
+    penyakit: Optional[str] = None
+    deskripsi: Optional[str] = None
+    bounding_box: Optional[BoundingBox] = None
+    message: Optional[str] = None
 
 app = FastAPI()
 
@@ -15,96 +34,91 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
-# Load dua model
-model_kualitas = YOLO("train21/weights/best.pt")   # T1-T4
-model_penyakit = YOLO("train6/weights/best.pt")    # penyakit
+model_kualitas = YOLO("train21/weights/best.pt")        # T1–T4
+model_penyakit_1 = YOLO("train6/weights/best.pt")       # Penyakit lama
+model_penyakit_2 = YOLO("train-tea-obb2/weights/best.pt")  # Penyakit OBB terbaru
 
 CONFIDENCE_THRESHOLD = 0.3
 
-# Deskripsi penyakit
 penyakit_deskripsi = {
-    "Blister Blight": "Si perusak daun muda. Jamur Exobasidium vexans menyebabkan gelembung kecil pada daun muda, terutama saat musim hujan. Jika dibiarkan, dapat menurunkan kualitas panen.",
-    "Brown Blight": "Si Penyebar Noda Cokelat. Jamur Colletotrichum camelliae membentuk bercak coklat tak beraturan yang membuat daun rontok. Umumnya muncul di cuaca lembab dan minim sinar matahari.",
-    "Gray blight": "Bercak abu-abu hingga cokelat kehitaman dikelilingi warna kuning yang membuat daun terlihat muram. Disebabkan jamur Pestalotiopsis theae dan menyerang daun yang lebih tua.",
-    "Red rust": "Bercak jingga kemerahan mencolok akibat ganggang Cephaleuros parasiticus. Mengganggu jaringan tanaman dan mengurangi hasil panen. Sering muncul di tempat lembab dengan sirkulasi udara buruk."
+    "Blister Blight": "Si perusak daun muda. Jamur Exobasidium vexans ...",
+    "Brown Blight": "Jamur Colletotrichum camelliae ...",
+    "Gray blight": "Bercak abu-abu kehitaman ...",
+    "Red rust": "Bercak jingga kemerahan mencolok ..."
 }
 
-@app.post("/predict")
+@app.post("/predict", response_model=PredictResponse)
 async def predict(file: UploadFile = File(...)):
     try:
+        if not file.content_type.startswith("image/"):
+            return {"status": "Unknown", "message": "File yang diunggah bukan gambar"}
+
         contents = await file.read()
         image = Image.open(io.BytesIO(contents)).convert("RGB")
 
-        # ----------------------
-        # Cek model kualitas (T1–T4)
-        # ----------------------
-        results_kualitas = model_kualitas(image)
-        kualitas_boxes = results_kualitas[0].boxes
-        kualitas_prediksi = []
+        semua_prediksi = []
 
-        best_kualitas_conf = 0
-        kualitas_label = None
+        # Model penyakit 1
+        results_p1 = model_penyakit_1(image)
+        if results_p1[0].boxes:
+            for box in results_p1[0].boxes:
+                c = float(box.conf)
+                if c >= CONFIDENCE_THRESHOLD:
+                    label = results_p1[0].names[int(box.cls)]
+                    semua_prediksi.append({"label": label, "conf": c, "box": box})
 
-        for box in kualitas_boxes:
-            conf = float(box.conf)
-            if conf > CONFIDENCE_THRESHOLD:
-                if conf > best_kualitas_conf:
-                    best_kualitas_conf = conf
-                    kualitas_label = results_kualitas[0].names[int(box.cls)]
+        # Model penyakit 2
+        results_p2 = model_penyakit_2(image)
+        if results_p2[0].boxes:
+            for box in results_p2[0].boxes:
+                c = float(box.conf)
+                if c >= CONFIDENCE_THRESHOLD:
+                    label = results_p2[0].names[int(box.cls)]
+                    semua_prediksi.append({"label": label, "conf": c, "box": box})
 
-                kualitas_prediksi.append({
-                    "kualitas": results_kualitas[0].names[int(box.cls)],
-                    "confidence": round(conf, 2)
-                })
+        # Model kualitas
+        results_k = model_kualitas(image)
+        if results_k[0].boxes:
+            for box in results_k[0].boxes:
+                c = float(box.conf)
+                if c >= CONFIDENCE_THRESHOLD:
+                    label = results_k[0].names[int(box.cls)]
+                    semua_prediksi.append({"label": label, "conf": c, "box": box})
 
-        # ----------------------
-        # Cek model penyakit
-        # ----------------------
-        results_penyakit = model_penyakit(image)
-        penyakit_boxes = results_penyakit[0].boxes
-        penyakit_prediksi = []
+        if not semua_prediksi:
+            return {"status": "Unknown", "message": "Gambar bukan daun teh atau tidak terdeteksi."}
 
-        best_penyakit_conf = 0
-        penyakit_label = None
+        # Pilih prediksi dengan confidence tertinggi
+        best = max(semua_prediksi, key=lambda x: x["conf"])
+        label, conf, box = best["label"], best["conf"], best["box"]
+        x1, y1, x2, y2 = box.xyxy[0].tolist()
 
-        for box in penyakit_boxes:
-            conf = float(box.conf)
-            if conf > CONFIDENCE_THRESHOLD:
-                if conf > best_penyakit_conf:
-                    best_penyakit_conf = conf
-                    penyakit_label = results_penyakit[0].names[int(box.cls)]
-
-                penyakit_prediksi.append({
-                    "penyakit": results_penyakit[0].names[int(box.cls)],
-                    "confidence": round(conf, 2)
-                })
-
-        # ----------------------
-        # LOGIKA AKHIR
-        # ----------------------
-        if not kualitas_prediksi and not penyakit_prediksi:
-            return {
-                "status": "Unknown",
-                "message": "Gambar bukan daun teh atau foto lebih dekat.",
-            }
-
-        if best_kualitas_conf >= best_penyakit_conf:
+        # Tentukan hasil berdasarkan label
+        if label in ["T1", "T2", "T3", "T4"]:
             return {
                 "status": "Healthy",
-                "kualitas": kualitas_label,
-                "confidence": round(best_kualitas_conf, 2)
-                
+                "kualitas": label,
+                "confidence": round(conf, 2),
+                "bounding_box": {
+                    "x": round(x1), "y": round(y1),
+                    "width": round(x2 - x1), "height": round(y2 - y1)
+                }
+            }
+        else:
+            return {
+                "status": "Sick",
+                "penyakit": label,
+                "confidence": round(conf, 2),
+                "deskripsi": penyakit_deskripsi.get(label, "Deskripsi tidak ditemukan."),
+                "bounding_box": {
+                    "x": round(x1), "y": round(y1),
+                    "width": round(x2 - x1), "height": round(y2 - y1)
+                }
             }
 
-        return {
-            "status": "Sick",
-            "penyakit": penyakit_label,
-            "confidence": round(best_penyakit_conf, 2),
-            "deskripsi": penyakit_deskripsi.get(penyakit_label, "Deskripsi tidak ditemukan.")
-        }
-
     except Exception as e:
-        return {"error": str(e)}
+        traceback.print_exc()
+        return {"status": "Error", "message": str(e)}
 
 if __name__ == "__main__":
     uvicorn.run("API:app", host="127.0.0.1", port=8000, reload=True)

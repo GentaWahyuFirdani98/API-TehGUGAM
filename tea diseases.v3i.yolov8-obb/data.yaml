@@ -1,0 +1,12 @@
+path: C:/ppl code/yolo/AI/tea diseases.v3i.yolov8-obb  # <-- tambahkan baris ini
+
+train: train/images
+val: valid/images
+test: test/images
+
+names:
+  0: Blister Blight
+  1: Brown Blight
+  2: Gray blight
+  3: Healthy
+  4: Red rust
